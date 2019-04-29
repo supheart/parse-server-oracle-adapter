@@ -1,6 +1,6 @@
 const oracledb = require('oracledb');
 const { defaultUniqueKeyLength } = require('./config');
-const { debug, getSqlTextByArray, getDatabaseOptionsFromURI } = require('./util');
+const { debug, getSqlTextByArray, getInsertValue, getDatabaseOptionsFromURI } = require('./util');
 const { toParseSchema, toOracleSchema, handleDotFields, validateKeys, formatDateToOracle, toOracleValue, parseTypeToOracleType, buildWhereClause, joinTablesForSchema } = require('./format');
 
 const TABLE_OWNER = 'MORIA';
@@ -199,14 +199,14 @@ class Adapter {
       .then(() => this.getJSONValue(className, 'schema', { className }))
       .then((res) => {
         res.classLevelPermissions = clps;
-        const sqlText = `UPDATE "_SCHEMA" SET "schema" = '${JSON.stringify(res)}' WHERE "className" = '${className}'`;
+        const sqlText = `UPDATE "_SCHEMA" SET "schema" = '${getInsertValue(res)}' WHERE "className" = '${className}'`;
         return this.conn.execute(sqlText);
       });
   }
   createClass(className, schema) {
     debug('createClass', { className, schema });
 
-    const qs = `INSERT INTO "_SCHEMA" ("className", "schema", "isParseClass") VALUES ('${schema.className}', '${JSON.stringify(schema)}', 1)`;
+    const qs = `INSERT INTO "_SCHEMA" ("className", "schema", "isParseClass") VALUES ('${schema.className}', '${getInsertValue(schema)}', 1)`;
     return this.createTable(className, schema)
       .then(() => this.conn.execute(qs))
       .then(() => toParseSchema(schema))
@@ -241,7 +241,7 @@ class Adapter {
         const schemaObject = schemaResult.rows[0].schema ? JSON.parse(schemaResult.rows[0].schema) : { fields: {} };
         if (!schemaObject.fields[fieldName]) {
           schemaObject.fields[fieldName] = type;
-          const updateSchemaSql = `UPDATE "_SCHEMA" SET "schema"= '${JSON.stringify(schemaObject)}' WHERE "className"='${className}'`;
+          const updateSchemaSql = `UPDATE "_SCHEMA" SET "schema"= '${getInsertValue(schemaObject)}' WHERE "className"='${className}'`;
           return this.conn.execute(updateSchemaSql);
         }
         throw 'Attempted to add a field that already exists';
@@ -304,7 +304,7 @@ class Adapter {
     return this.getJSONValue('_SCHEMA', 'schema', { className })
       .then((res) => {
         res.fields = schema.fields;
-        const updateSql = `UPDATE "_SCHEMA" SET "schema" = '${JSON.stringify(res)}' WHERE "className" = '${className}'`;
+        const updateSql = `UPDATE "_SCHEMA" SET "schema" = '${getInsertValue(res)}' WHERE "className" = '${className}'`;
         return this.conn.execute(updateSql);
       })
       .then(() => {
@@ -400,15 +400,21 @@ class Adapter {
         case 'Array':
         case 'Object':
         case 'Bytes':
-          valuesArray.push(JSON.stringify(object[fieldName]));
+          valuesArray.push(getInsertValue(object[fieldName]));
           break;
-        case 'String':
         case 'Number':
           if (!object[fieldName]) {
             valuesArray.push(0);
             break;
           }
           valuesArray.push(object[fieldName]);
+          break;
+        case 'String':
+          if (!object[fieldName]) {
+            valuesArray.push('');
+            break;
+          }
+          valuesArray.push(getInsertValue(object[fieldName]));
           break;
         case 'Boolean':
           valuesArray.push(object[fieldName] ? 1 : 0);
@@ -521,7 +527,7 @@ class Adapter {
         //     if (value.__op === 'Delete') {
         //       value = null;
         //     } else {
-        //       value = JSON.stringify(value);
+        //       value = getInsertValue(value);
         //     }
         //   }
         //   values.push(key, value);
@@ -534,7 +540,7 @@ class Adapter {
         index += 2;
       } else if (fieldValue.__op === 'Add') {
         updatePatterns.push(`":name${index}:"= JSON_ARRAY_INSERT(COALESCE(":name${index}:", '[]'), CONCAT('$[',JSON_LENGTH(":name${index}:"),']'), ':name${index + 1}:')`);
-        values.push(fieldName, JSON.stringify(fieldValue.objects));
+        values.push(fieldName, getInsertValue(fieldValue.objects));
         index += 2;
       } else if (fieldValue.__op === 'Delete') {
         updatePatterns.push(`":name${index}:" = $${index + 1}`);
@@ -544,7 +550,7 @@ class Adapter {
         fieldValue.objects.forEach((obj) => {
           updatePatterns.push(`":name${index}:" = JSON_REMOVE(":name${index}:", REPLACE(JSON_SEARCH(COALESCE(":name${index}:",'[]'), 'one', ':name${index + 1}:'),'"',''))`);
           if (typeof obj === 'object') {
-            values.push(fieldName, JSON.stringify(obj));
+            values.push(fieldName, getInsertValue(obj));
           } else {
             values.push(fieldName, obj);
           }
@@ -554,7 +560,7 @@ class Adapter {
         fieldValue.objects.forEach((obj) => {
           updatePatterns.push(`":name${index}:" = if (JSON_CONTAINS(":name${index}:", ':name${index + 1}:') = 0, JSON_MERGE(":name${index}:",':name${index + 1}:'),":name${index}:")`);
           if (typeof obj === 'object') {
-            values.push(fieldName, JSON.stringify(obj));
+            values.push(fieldName, getInsertValue(obj));
           } else {
             values.push(fieldName, obj);
           }
@@ -566,11 +572,11 @@ class Adapter {
         index += 2;
       } else if (typeof fieldValue === 'string') {
         updatePatterns.push(`":name${index}:" = ':name${index + 1}:'`);
-        values.push(fieldName, fieldValue);
+        values.push(fieldName, getInsertValue(fieldValue));
         index += 2;
       } else if (typeof fieldValue === 'boolean') {
         updatePatterns.push(`":name${index}:" = :name${index + 1}:`);
-        values.push(fieldName, fieldValue);
+        values.push(fieldName, fieldValue ? 1 : 0);
         index += 2;
       } else if (fieldValue.__type === 'Pointer') {
         updatePatterns.push(`":name${index}:" = ':name${index + 1}:'`);
@@ -607,7 +613,7 @@ class Adapter {
 
         // let setPattern = '';
         // if (keysToSet.length > 0) {
-        //   setPattern = keysToSet.map(() => `CAST('${JSON.stringify(fieldValue)}' AS JSON)`);
+        //   setPattern = keysToSet.map(() => `CAST('${getInsertValue(fieldValue)}' AS JSON)`);
         // }
         // const keysToReplace = Object.keys(originalUpdate).filter(k =>
         //   // choose top level fields that dont have operation
@@ -617,7 +623,7 @@ class Adapter {
         // if (keysToReplace.length > 0) {
         //   replacePattern = keysToReplace.map((c) => {
         //     if (typeof fieldValue[c] === 'object') {
-        //       return `'$.${c}', CAST('${JSON.stringify(fieldValue[c])}' AS JSON)`;
+        //       return `'$.${c}', CAST('${getInsertValue(fieldValue[c])}' AS JSON)`;
         //     }
         //     return `'$.${c}', '${fieldValue[c]}'`;
         //   }).join(' || ');
@@ -662,17 +668,17 @@ class Adapter {
         //   updatePatterns.push(`":name${index}:" = ${setPattern}`);
         // }
 
-        // values.push(fieldName, ...keysToDelete, JSON.stringify(fieldValue));
+        // values.push(fieldName, ...keysToDelete, getInsertValue(fieldValue));
         // index += 2 + keysToDelete.length;
 
         updatePatterns.push(`":name${index}:" = ':name${index + 1}:'`);
-        values.push(fieldName, JSON.stringify(fieldValue));
+        values.push(fieldName, getInsertValue(fieldValue));
         index += 2;
       } else if (Array.isArray(fieldValue)
         && schema.fields[fieldName]
         && schema.fields[fieldName].type === 'Array') {
         updatePatterns.push(`":name${index}:" = ':name${index + 1}:'`);
-        values.push(fieldName, JSON.stringify(fieldValue));
+        values.push(fieldName, getInsertValue(fieldValue));
         index += 2;
       } else {
         debug('Not supported update', fieldName, fieldValue);
@@ -774,17 +780,17 @@ class Adapter {
     const sq = `SELECT * FROM ":name1:" ${wherePattern} ${sortPattern}`;
     const norsql = getSqlTextByArray(sq.trim(), values);
 
-    const qs = `SELECT * FORM (SELECT st.${columns}, ROWNUM rn FROM (${norsql}) st WHERE ROWNUM <= :rowEnd:) WHERE rn > :rowStart:`;
+    const qs = `SELECT * FROM (SELECT st.${columns}, ROWNUM rn FROM (${norsql}) st WHERE ROWNUM <= :rowEnd:) WHERE rn > :rowStart:`;
     let sqlText = '';
 
     if (rowStart === 0 && rowEnd === 0) {
       sqlText = norsql;
     } else if (rowStart > 0 && rowEnd === 0) {
-      sqlText = qs.replace(':rowEnd:', `(SELECT COUNT(*) FROM ${className})`).replace(':rowStart:', skip);
+      sqlText = qs.replace(':rowEnd:', `(SELECT COUNT(*) FROM ${className})`).replace(':rowStart:', rowStart);
     } else if (rowStart === 0 && rowEnd > 0) {
-      sqlText = `SELECT ${columns} FROM (${norsql}) WHERE ROWNUM < ${limit}`;
+      sqlText = `SELECT ${columns} FROM (${norsql}) WHERE ROWNUM < ${rowEnd}`;
     } else {
-      sqlText = qs.replace(':rowEnd:', limit).replace(':rowStart:', skip);
+      sqlText = qs.replace(':rowEnd:', rowEnd).replace(':rowStart:', rowStart);
     }
 
     return this.conn.execute(sqlText, {}, { outFormat: oracledb.OBJECT })
@@ -837,7 +843,11 @@ class Adapter {
           }
         });
         return object;
-      }));
+      }))
+      .catch((error) => {
+        console.log(`find: ${className}`, error);
+        return [];
+      });
   }
   ensureUniqueness(className, schema, fieldNames) {
     debug('ensureUniqueness', className, schema, fieldNames);
@@ -869,7 +879,8 @@ class Adapter {
       .then(() => this.conn.execute(sqlText))
       .then(res => res.rows[0][0])
       .catch((error) => {
-        throw error;
+        console.log(`count: ${className}`, error);
+        return 0;
       });
   }
   // 去重

@@ -4,7 +4,7 @@ const Parse = require('parse/node');
 // Duplicate from then mongo adapter...
 const parseTypeToOracleType = (type) => {
   switch (type.type) {
-    case 'String': return 'varchar2(2000)';
+    case 'String': return 'varchar2(4000)';
     case 'Date': return 'timestamp(6)';
     case 'Object': return 'varchar2(4000)';
     case 'File': return 'varchar2(2000)';
@@ -464,7 +464,7 @@ const buildWhereClause = ({ schema, query, index }) => {
 
     if (fieldValue.$regex) {
       let regex = fieldValue.$regex;
-      const operator = 'REGEXP';
+      const operator = 'REGEXP_LIKE';
       const opts = fieldValue.$options;
       if (opts) {
         // if (opts.indexOf('i') >= 0) {
@@ -477,7 +477,7 @@ const buildWhereClause = ({ schema, query, index }) => {
 
       regex = processRegexPattern(regex);
 
-      patterns.push(`":name${index}:" ${operator} ':name${index + 1}:'`);
+      patterns.push(`${operator}(":name${index}:", ':name${index + 1}:')`);
       values.push(fieldName, regex);
       index += 2;
     }

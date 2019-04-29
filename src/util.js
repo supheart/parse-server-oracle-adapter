@@ -9,9 +9,9 @@ const debug = (name, args) => {
     return;
   }
   // console.log(LOG_PREFIX, name);
-  log.info(LOG_PREFIX, name);
+  log.verbose(LOG_PREFIX, name);
   if (args) {
-    log.info(LOG_PREFIX, ' args:', args);
+    log.verbose(LOG_PREFIX, ' args:', args);
   }
 };
 
@@ -30,6 +30,16 @@ const turnSqlParams = (values, key, index = 1) => {
     valuesObj[`${key}${i + index}`] = e;
   });
   return valuesObj;
+};
+
+const getInsertValue = (val) => {
+  if (typeof val === 'object') {
+    val = JSON.stringify(val);
+  }
+  if (typeof val === 'string') {
+    val = val.replace(/'/g, "''");
+  }
+  return val;
 };
 
 const getSqlTextByArray = (sql, values, key = 'name', index = 1) => replaceVarn(sql, turnSqlParams(values, key, index));
@@ -108,6 +118,7 @@ module.exports = {
   replaceVarn,
   turnSqlParams,
   getSqlTextByArray,
+  getInsertValue,
   queryFormat,
   parseQueryParams,
   getDatabaseOptionsFromURI
