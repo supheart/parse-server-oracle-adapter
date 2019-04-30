@@ -4,6 +4,8 @@ const { debug, getSqlTextByArray, getInsertValue, getDatabaseOptionsFromURI } = 
 const { toParseSchema, toOracleSchema, handleDotFields, validateKeys, formatDateToOracle, toOracleValue, parseTypeToOracleType, buildWhereClause, joinTablesForSchema } = require('./format');
 
 const TABLE_OWNER = 'MORIA';
+// const POOL_NAME = 'PARSE_POOL';
+// const NEXT_POOL_NAME = 'NEXT_PARSE_POOL';
 oracledb.autoCommit = true;
 
 class Adapter {
@@ -22,30 +24,84 @@ class Adapter {
     });
 
     dbOptions.multipleStatements = true;
+    // pool attr
+    dbOptions.queueRequests = true;
+    dbOptions.queueTimeout = 60;
+    dbOptions.poolMin = 20;
+    dbOptions.poolMax = 50;
     this._databaseOptions = dbOptions;
     this.canSortOnJoinTables = false;
   }
 
+  initPool() {
+    if (this.pool) return Promise.resolve(this.pool);
+    // this._databaseOptions.poolAlias = poolAlias;
+    return oracledb.createPool(this._databaseOptions)
+      .then((pool) => {
+        this.pool = pool;
+        console.log('init pool');
+        return pool;
+      })
+      .catch((error) => {
+        if (error.message.indexOf('NJS-046') === 0) {
+          return this.initPool();
+        }
+        console.log('init pool error', error);
+        return Promise.reject(error);
+      });
+  }
   // 连接数据库
   connect() {
-    if (this.connectionPromise) {
-      return this.connectionPromise;
-    }
-    this.connectionPromise = oracledb.getConnection(this._databaseOptions).then((conn) => {
-      this.conn = conn;
-    }).catch((error) => {
-      delete this.connectionPromise;
-      return Promise.reject(error);
-    });
-    return this.connectionPromise;
+    return this.initPool()
+      .then(pool => pool.getConnection())
+      .then(c =>
+        // console.log('current connect', c);
+        c
+      )
+      .catch((error) => {
+        console.log('getConnection', error);
+        oracledb.getPool().close(10).then(() => {
+          console.log('Pool error closed');
+          delete this.pool;
+        });
+        // if (error.message.indexOf('NJS-040') === 0) {
+        //   delete this.pool;
+        // }
+      });
+  }
+
+  execute(sql, params = {}, output = { outFormat: oracledb.ARRAY }) {
+    let result = null;
+    let database = null;
+    return this.connect()
+      .then((c) => {
+        database = c;
+        return database.execute(sql, params, output);
+      })
+      .then((res) => {
+        result = res;
+      })
+      .then(() => {
+        if (database) {
+          return database.close();
+        }
+      })
+      .then(() => result)
+      .catch((error) => {
+        console.log('execute', error, sql);
+        return { rows: [] };
+      });
   }
 
   // 结束关闭连接
   handleShutdown() {
-    if (!this.conn) {
+    if (!this.pool) {
       return;
     }
-    this.conn.close();
+    oracledb.getPool().close(10).then(() => {
+      console.log('Pool closed');
+      delete this.pool;
+    });
   }
 
   // 确认schema表是否存在
@@ -54,7 +110,7 @@ class Adapter {
 
     const sqlText = 'CREATE TABLE "_SCHEMA" ("className" VARCHAR2(120 BYTE) NOT NULL, PRIMARY KEY("className"), "schema" VARCHAR2(4000), "isParseClass" NUMBER(1))';
     return this.classExists('_SCHEMA')
-      .then(es => (!es ? this.conn.execute(sqlText) : Promise.resolve()));
+      .then(es => (!es ? this.execute(sqlText) : Promise.resolve()));
   }
 
   // 创建表
@@ -124,15 +180,14 @@ class Adapter {
     const qs = `CREATE TABLE ":varn1:" (${patternsArray.join(',')})`;
     const sqlText = getSqlTextByArray(qs, [className, ...valuesArray], 'varn');
 
-    return this.connect()
-      .then(() => this.classExists(className))
+    return this.classExists(className)
       .then((existsTable) => {
         if (!existsTable) {
           // TODO 自动更新时间字段
           // if (Object.keys(fields).indexOf('updatedAt') > -1) {
-          //   await this.conn.execute(triggerSql);
+          //   await this.execute(triggerSql);
           // }
-          return this.conn.execute(sqlText);
+          return this.execute(sqlText);
         }
       })
       .then(() => {
@@ -140,7 +195,7 @@ class Adapter {
           const joinTableName = `_Join:${filedName}:${className}`;
           const joinTableSql = `CREATE TABLE "${joinTableName}" ("relatedId" varChar(120), "owningId" varChar(120), PRIMARY KEY("relatedId", "owningId"))`;
           return this.classExists(joinTableName)
-            .then(etj => (!etj ? this.conn.execute(joinTableSql) : Promise.resolve()));
+            .then(etj => (!etj ? this.execute(joinTableSql) : Promise.resolve()));
         });
         return Promise.all(promises);
       })
@@ -164,16 +219,14 @@ class Adapter {
     debug('getJSONValue', className, fieldName, query);
 
     const sqlText = this._getJSONSelectQuery(className, fieldName, query);
-    return this.connect()
-      .then(() => this.conn.execute(sqlText))
+    return this.execute(sqlText)
       .then(res => (res.rows[0] ? JSON.parse(res.rows[0]) : {}));
   }
   getJSONValues(className, fieldName, query) {
     debug('getJSONValues', className, fieldName, query);
 
     const sqlText = this._getJSONSelectQuery(className, fieldName, query);
-    return this.connect()
-      .then(() => this.conn.execute(sqlText))
+    return this.execute(sqlText)
       .then((res) => {
         const result = [];
         res.rows.forEach((row) => {
@@ -187,10 +240,12 @@ class Adapter {
   classExists(className, owner = TABLE_OWNER) {
     debug('classExists', className);
     const sql = `select count(1) from all_tables where TABLE_NAME = '${className}' and OWNER='${owner}'`;
-    return this.connect()
-      .then(() => this.conn.execute(sql))
+    return this.execute(sql)
       .then(result => !!result.rows[0][0])
-      .catch(() => Promise.resolve(false));
+      .catch((error) => {
+        console.log('class exists', error);
+        Promise.resolve(false);
+      });
   }
   setClassLevelPermissions(className, clps) {
     debug('setClassLevelPermissions', className);
@@ -200,7 +255,7 @@ class Adapter {
       .then((res) => {
         res.classLevelPermissions = clps;
         const sqlText = `UPDATE "_SCHEMA" SET "schema" = '${getInsertValue(res)}' WHERE "className" = '${className}'`;
-        return this.conn.execute(sqlText);
+        return this.execute(sqlText);
       });
   }
   createClass(className, schema) {
@@ -208,7 +263,7 @@ class Adapter {
 
     const qs = `INSERT INTO "_SCHEMA" ("className", "schema", "isParseClass") VALUES ('${schema.className}', '${getInsertValue(schema)}', 1)`;
     return this.createTable(className, schema)
-      .then(() => this.conn.execute(qs))
+      .then(() => this.execute(qs))
       .then(() => toParseSchema(schema))
       .catch((err) => {
         throw err;
@@ -223,26 +278,26 @@ class Adapter {
       if (type.type === 'Date') {
         oracleType = 'timestamp(6) null default null';
       }
-      promise = this.conn.execute(`ALTER TABLE "${className}" ADD ("${fieldName}" ${oracleType})`);
+      promise = this.execute(`ALTER TABLE "${className}" ADD ("${fieldName}" ${oracleType})`);
     } else {
       const relationTable = `_Join:${fieldName}:${className}`;
       const sq = `CREATE TABLE "${relationTable}" ("relatedId" varChar2(120), "owningId" varChar2(120), PRIMARY KEY("relatedId", "owningId"))`;
       promise = this.classExists(relationTable)
-        .then(et => (!et ? this.conn.execute(sq) : Promise.resolve()));
+        .then(et => (!et ? this.execute(sq) : Promise.resolve()));
     }
 
     return promise
       .then(() => {
         // 先查询出当前类的内容
         const schemaQuerySql = `SELECT "schema" FROM "_SCHEMA" WHERE "className" = '${className}'`;
-        return this.conn.execute(schemaQuerySql, {}, { outFormat: oracledb.OBJECT });
+        return this.execute(schemaQuerySql, {}, { outFormat: oracledb.OBJECT });
       })
       .then((schemaResult) => {
         const schemaObject = schemaResult.rows[0].schema ? JSON.parse(schemaResult.rows[0].schema) : { fields: {} };
         if (!schemaObject.fields[fieldName]) {
           schemaObject.fields[fieldName] = type;
           const updateSchemaSql = `UPDATE "_SCHEMA" SET "schema"= '${getInsertValue(schemaObject)}' WHERE "className"='${className}'`;
-          return this.conn.execute(updateSchemaSql);
+          return this.execute(updateSchemaSql);
         }
         throw 'Attempted to add a field that already exists';
       });
@@ -252,10 +307,9 @@ class Adapter {
 
     const dropText = `DROP TABLE "${className}"`;
     const deleteText = `DELETE FROM "_SCHEMA" WHERE "className" = '${className}';`;
-    return this.connect()
-      .then(() => this.classExists(className))
-      .then(et => (!et ? this.conn.execute(dropText) : Promise.resolve()))
-      .then(() => this.conn.execute(deleteText))
+    return this.classExists(className)
+      .then(et => (!et ? this.execute(dropText) : Promise.resolve()))
+      .then(() => this.execute(deleteText))
       .catch((error) => {
         throw error;
       });
@@ -266,8 +320,7 @@ class Adapter {
     const now = new Date().getTime();
     const selectText = 'SELECT * FROM "_SCHEMA"';
     const originClass = ['_SCHEMA', '_PushStatus', '_JobStatus', '_JobSchedule', '_Hooks', '_GlobalConfig', '_Audience'];
-    return this.connect()
-      .then(() => this.conn.execute(selectText, {}, { outFormat: oracledb.OBJECT }))
+    return this.execute(selectText, {}, { outFormat: oracledb.OBJECT })
       .then((res) => {
         const resClass = res.rows.map(r => r.className);
         const joins = res.rows.reduce((list, schema) => list.concat(joinTablesForSchema(JSON.parse(schema.schema))), []);
@@ -275,7 +328,7 @@ class Adapter {
         const promises = classes.map((c) => {
           const sqlText = `DROP TABLE "${c}"`;
           return this.classExists(c)
-            .then(et => (et ? this.conn.execute(sqlText) : Promise.resolve()));
+            .then(et => (et ? this.execute(sqlText) : Promise.resolve()));
         });
         return Promise.all(promises);
       })
@@ -305,13 +358,13 @@ class Adapter {
       .then((res) => {
         res.fields = schema.fields;
         const updateSql = `UPDATE "_SCHEMA" SET "schema" = '${getInsertValue(res)}' WHERE "className" = '${className}'`;
-        return this.conn.execute(updateSql);
+        return this.execute(updateSql);
       })
       .then(() => {
         if (values.length > 1) {
           const aqs = `ALTER TABLE ":name1:" DROP COLUMN ${columns}`;
           const alterText = getSqlTextByArray(aqs, values);
-          return this.conn.execute(alterText);
+          return this.execute(alterText);
         }
         return Promise.resolve();
       })
@@ -323,7 +376,7 @@ class Adapter {
     debug('getAllClasses');
 
     return this._ensureSchemaCollectionExists()
-      .then(() => this.conn.execute('SELECT * FROM "_SCHEMA"', {}, { outFormat: oracledb.OBJECT }))
+      .then(() => this.execute('SELECT * FROM "_SCHEMA"', {}, { outFormat: oracledb.OBJECT }))
       .then(result => result.rows.map(row => toParseSchema({ className: row.className, ...JSON.parse(row.schema) })));
   }
   getClass(className) {
@@ -331,7 +384,7 @@ class Adapter {
 
     // TODO 原来有按字符排序的sql：SELECT * FROM `_SCHEMA` WHERE `className` COLLATE latin1_general_cs =\'$1:name\
     const classSql = `SELECT * FROM "_SCHEMA" WHERE "className" = '${className}'`;
-    return this.conn.execute(classSql, {}, { outFormat: oracledb.OBJECT })
+    return this.execute(classSql, {}, { outFormat: oracledb.OBJECT })
       .then((result) => {
         if (result.rows.length === 1) {
           return JSON.parse(result.rows[0].schema);
@@ -454,7 +507,7 @@ class Adapter {
     const values = [className, ...columnsArray, ...valuesArray];
     const sqlText = getSqlTextByArray(qs, values);
 
-    return this.conn.execute(sqlText)
+    return this.execute(sqlText)
       .then(() => ({ ops: [object] }));
   }
   deleteObjectsByQuery(className, schema, query) {
@@ -470,14 +523,12 @@ class Adapter {
     const qs = `DELETE FROM ":name1:" WHERE ${where.pattern}`;
     const sqlText = getSqlTextByArray(qs, values);
 
-    return this.connect()
-      .then(() => this.conn.execute(sqlText))
+    return this.execute(sqlText)
       .then((res) => {
         if (res.rowsAffected === 0) {
-          throw 'Object not found.';
-        } else {
-          return res.rowsAffected;
+          console.log('Object not found.');
         }
+        return res.rowsAffected;
       });
   }
   updateObjectsByQuery(className, schema, query, update) {
@@ -691,7 +742,7 @@ class Adapter {
 
     const qs = `UPDATE ":name1:" SET ${updatePatterns.join(',')} WHERE ${where.pattern}`;
     const sqlText = getSqlTextByArray(qs, values);
-    return this.conn.execute(sqlText)
+    return this.execute(sqlText)
       .then((result) => {
         if (result.rowsAffected > 0) {
           return this.find(className, schema, query, { limit: result.rowsAffected });
@@ -793,57 +844,61 @@ class Adapter {
       sqlText = qs.replace(':rowEnd:', rowEnd).replace(':rowStart:', rowStart);
     }
 
-    return this.conn.execute(sqlText, {}, { outFormat: oracledb.OBJECT })
-      .then(result => result.rows.map((obj) => {
-        const object = obj;
-        Object.keys(schema.fields).forEach((fieldName) => {
-          if (schema.fields[fieldName].type === 'Pointer' && object[fieldName]) {
-            object[fieldName] = { objectId: object[fieldName], __type: 'Pointer', className: schema.fields[fieldName].targetClass };
-          }
-          if (schema.fields[fieldName].type === 'Relation') {
-            object[fieldName] = {
-              __type: 'Relation',
-              className: schema.fields[fieldName].targetClass
-            };
-          }
-          if (object[fieldName] && schema.fields[fieldName].type === 'GeoPoint') {
-            object[fieldName] = {
-              __type: 'GeoPoint',
-              latitude: object[fieldName].y,
-              longitude: object[fieldName].x
-            };
-          }
-          if (object[fieldName] && schema.fields[fieldName].type === 'File') {
-            object[fieldName] = {
-              __type: 'File',
-              name: object[fieldName]
-            };
-          }
-          if (object[fieldName] !== undefined && schema.fields[fieldName].type === 'Boolean') {
-            object[fieldName] = object[fieldName] === 1;
-          }
-          if (object[fieldName] && (schema.fields[fieldName].type === 'Object' || schema.fields[fieldName].type === 'Array')) {
-            object[fieldName] = JSON.parse(object[fieldName]);
-          }
-        });
+    return this.execute(sqlText, {}, { outFormat: oracledb.OBJECT })
+      .then((result) => {
+        // console.log(result);
+        const resultList = result.rows.map((obj) => {
+          const object = obj;
+          Object.keys(schema.fields).forEach((fieldName) => {
+            if (schema.fields[fieldName].type === 'Pointer' && object[fieldName]) {
+              object[fieldName] = { objectId: object[fieldName], __type: 'Pointer', className: schema.fields[fieldName].targetClass };
+            }
+            if (schema.fields[fieldName].type === 'Relation') {
+              object[fieldName] = {
+                __type: 'Relation',
+                className: schema.fields[fieldName].targetClass
+              };
+            }
+            if (object[fieldName] && schema.fields[fieldName].type === 'GeoPoint') {
+              object[fieldName] = {
+                __type: 'GeoPoint',
+                latitude: object[fieldName].y,
+                longitude: object[fieldName].x
+              };
+            }
+            if (object[fieldName] && schema.fields[fieldName].type === 'File') {
+              object[fieldName] = {
+                __type: 'File',
+                name: object[fieldName]
+              };
+            }
+            if (object[fieldName] !== undefined && schema.fields[fieldName].type === 'Boolean') {
+              object[fieldName] = object[fieldName] === 1;
+            }
+            if (object[fieldName] && (schema.fields[fieldName].type === 'Object' || schema.fields[fieldName].type === 'Array')) {
+              object[fieldName] = JSON.parse(object[fieldName]);
+            }
+          });
 
-        if (object.createdAt) {
-          object.createdAt = object.createdAt.toISOString();
-        }
-        if (object.updatedAt) {
-          object.updatedAt = object.updatedAt.toISOString();
-        }
+          if (object.createdAt) {
+            object.createdAt = object.createdAt.toISOString();
+          }
+          if (object.updatedAt) {
+            object.updatedAt = object.updatedAt.toISOString();
+          }
 
-        Object.keys(object).forEach((key) => {
-          if (object[key] === null) {
-            delete object[key];
-          }
-          if (object[key] instanceof Date) {
-            object[key] = { __type: 'Date', iso: object[key].toISOString() };
-          }
+          Object.keys(object).forEach((key) => {
+            if (object[key] === null) {
+              delete object[key];
+            }
+            if (object[key] instanceof Date) {
+              object[key] = { __type: 'Date', iso: object[key].toISOString() };
+            }
+          });
+          return object;
         });
-        return object;
-      }))
+        return resultList;
+      })
       .catch((error) => {
         console.log(`find: ${className}`, error);
         return [];
@@ -858,7 +913,7 @@ class Adapter {
 
     const sqlText = getSqlTextByArray(qs, [className, constraintName, ...fieldNames]);
 
-    return this.conn.execute(sqlText)
+    return this.execute(sqlText)
       .catch((error) => {
         // 2261，数据库中存在此唯一
         if (error.errorNum === 2261) return Promise.resolve();
@@ -875,8 +930,7 @@ class Adapter {
     const wherePattern = where.pattern.length > 0 ? `WHERE ${where.pattern}` : '';
     const qs = `SELECT count(*) FROM ":name1:" ${wherePattern}`;
     const sqlText = getSqlTextByArray(qs, values).trim();
-    return this.connect()
-      .then(() => this.conn.execute(sqlText))
+    return this.execute(sqlText)
       .then(res => res.rows[0][0])
       .catch((error) => {
         console.log(`count: ${className}`, error);
@@ -897,9 +951,11 @@ class Adapter {
     debug('performInitialization', VolatileClassesSchemas.map(row => row.className));
     global.isInitialized = true;
 
-    const promises = VolatileClassesSchemas.map(schema => this.createTable(schema.className, schema));
-
-    return Promise.all(promises)
+    return this.initPool()
+      .then(() => {
+        const promises = VolatileClassesSchemas.map(schema => this.createTable(schema.className, schema));
+        return Promise.all(promises);
+      })
       .then(() => {
         global.isInitialized = false;
         debug('initializationDone');
@@ -911,18 +967,16 @@ class Adapter {
 
     const promises = indexes.map((i) => {
       const sqlText = `CREATE INDEX "${i.name}" ON "${className}" ("${i.key}")`;
-      return this.conn.execute(sqlText);
+      return this.execute(sqlText);
     });
 
-    return this.connect()
-      .then(() => Promise.all(promises));
+    return Promise.all(promises);
   }
   getIndexes(className) {
     debug('getIndexes', className);
 
     const sqlText = `SELECT owner, index_name, table_name FROM all_indexes WHERE table_name = '${className}'`;
-    return this.connect()
-      .then(() => this.conn.execute(sqlText, {}, { outFormat: oracledb.OBJECT }));
+    return this.execute(sqlText, {}, { outFormat: oracledb.OBJECT });
   }
   updateSchemaWithIndexes() {
     debug('updateSchemaWithIndexes');
