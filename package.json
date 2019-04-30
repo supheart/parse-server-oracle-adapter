@@ -1,6 +1,6 @@
 {
   "name": "parse-server-oracle-adapter",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Oracle Adapter for Parse Server",
   "main": "lib/index.js",
   "scripts": {
